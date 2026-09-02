@@ -1,0 +1,54 @@
+name: Reusable - Maven CI
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: true
+        type: string
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: ${{ inputs.working_directory }}/pom.xml
+
+      - name: Maven test and package
+        run: mvn -B clean verify
+
+      - name: Build container locally
+        run: docker build -t local-ci:${GITHUB_SHA} .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: local-ci:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.working_directory }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
