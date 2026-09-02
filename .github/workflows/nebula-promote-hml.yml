@@ -1,0 +1,42 @@
+name: Nebula API - Promote HML
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nebula-api-hml
+  cancel-in-progress: false
+
+jobs:
+  resolve-release:
+    uses: ./.github/workflows/reusable-resolve-promotion.yml
+    with:
+      source_environment: dev
+      aws_region: ${{ vars.HML_AWS_REGION }}
+      aws_account_id: ${{ vars.HML_AWS_ACCOUNT_ID }}
+      aws_role_arn: ${{ vars.HML_AWS_OIDC_ROLE_ARN }}
+      ecr_repository: ${{ vars.HML_ECR_REPOSITORY }}
+
+  terraform:
+    needs: resolve-release
+    uses: ./.github/workflows/reusable-terraform-deploy.yml
+    with:
+      working_directory: nebula-api/infra
+      environment: hml
+      release_sha: ${{ needs.resolve-release.outputs.release_sha }}
+      aws_region: ${{ vars.HML_AWS_REGION }}
+      aws_account_id: ${{ vars.HML_AWS_ACCOUNT_ID }}
+      aws_role_arn: ${{ vars.HML_AWS_OIDC_ROLE_ARN }}
+      state_bucket: ${{ vars.HML_TF_STATE_BUCKET }}
+      state_key: nebula-api/ecs/terraform.tfstate
+      image_uri: ${{ needs.resolve-release.outputs.image_uri }}
+      subnet_ids_json: ${{ vars.HML_ECS_SUBNET_IDS_JSON }}
+      security_group_ids_json: ${{ vars.HML_ECS_SECURITY_GROUP_IDS_JSON }}
+      execution_role_arn: ${{ vars.HML_ECS_EXECUTION_ROLE_ARN }}
+      github_app_id: ${{ vars.TERRAFORM_GH_APP_ID }}
+      always_require_approval: true
+    secrets:
+      github_app_private_key: ${{ secrets.TERRAFORM_GH_APP_PRIVATE_KEY }}
