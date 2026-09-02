@@ -1,0 +1,314 @@
+name: Reusable - Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      aws_region:
+        required: true
+        type: string
+      aws_account_id:
+        required: true
+        type: string
+      aws_role_arn:
+        required: true
+        type: string
+      state_bucket:
+        required: true
+        type: string
+      state_key:
+        required: true
+        type: string
+      image_uri:
+        required: true
+        type: string
+      subnet_ids_json:
+        required: true
+        type: string
+      security_group_ids_json:
+        required: true
+        type: string
+      execution_role_arn:
+        required: true
+        type: string
+      github_app_client_id:
+        required: false
+        default: ""
+        type: string
+      always_require_approval:
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      github_app_private_key:
+        required: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      has_destroy: ${{ steps.analyze.outputs.has_destroy }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Create GitHub App token for private modules
+        id: app-token
+        if: inputs.github_app_client_id != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.github_app_client_id }}
+          private-key: ${{ secrets.github_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - name: Configure Git authentication for private Terraform modules
+        if: inputs.github_app_client_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          allowed-account-ids: ${{ inputs.aws_account_id }}
+          role-session-name: gha-tf-plan-${{ github.run_id }}
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ inputs.state_bucket }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v6
+
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+      - name: Trivy IaC gate
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.working_directory }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Terraform plan
+        env:
+          TF_VAR_environment: ${{ inputs.environment }}
+          TF_VAR_image_uri: ${{ inputs.image_uri }}
+          TF_VAR_subnet_ids: ${{ inputs.subnet_ids_json }}
+          TF_VAR_security_group_ids: ${{ inputs.security_group_ids_json }}
+          TF_VAR_execution_role_arn: ${{ inputs.execution_role_arn }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Analyze destructive changes
+        id: analyze
+        run: |
+          terraform show -json tfplan > tfplan.json
+          DELETE_COUNT=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' tfplan.json)
+          CREATE_COUNT=$(jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' tfplan.json)
+          UPDATE_COUNT=$(jq '[.resource_changes[]? | select(.change.actions | index("update"))] | length' tfplan.json)
+
+          if [ "$DELETE_COUNT" -gt 0 ]; then
+            echo "has_destroy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_destroy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "## Terraform plan summary"
+            echo ""
+            echo "| Action | Count |"
+            echo "|---|---:|"
+            echo "| Create | ${CREATE_COUNT} |"
+            echo "| Update | ${UPDATE_COUNT} |"
+            echo "| Delete/Replace | ${DELETE_COUNT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add readable plan to summary
+        run: |
+          terraform show -no-color tfplan > tfplan.txt
+          {
+            echo ""
+            echo "<details><summary>Full Terraform plan</summary>"
+            echo ""
+            echo '```terraform'
+            head -c 60000 tfplan.txt
+            echo ""
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload exact Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Cleanup rendered plan files
+        if: always()
+        run: rm -f tfplan.json tfplan.txt
+
+  apply-safe:
+    needs: plan
+    if: needs.plan.outputs.has_destroy == 'false' && inputs.always_require_approval == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Create GitHub App token for private modules
+        id: app-token
+        if: inputs.github_app_client_id != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.github_app_client_id }}
+          private-key: ${{ secrets.github_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - name: Configure Git authentication
+        if: inputs.github_app_client_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          allowed-account-ids: ${{ inputs.aws_account_id }}
+          role-session-name: gha-tf-apply-${{ github.run_id }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ inputs.state_bucket }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}
+
+      - name: Terraform apply exact plan
+        run: terraform apply -input=false -auto-approve tfplan
+
+  apply-approved:
+    needs: plan
+    if: needs.plan.outputs.has_destroy == 'true' || inputs.always_require_approval == true
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-terraform-approval
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Create GitHub App token for private modules
+        id: app-token
+        if: inputs.github_app_client_id != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.github_app_client_id }}
+          private-key: ${{ secrets.github_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
+      - name: Configure Git authentication
+        if: inputs.github_app_client_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          allowed-account-ids: ${{ inputs.aws_account_id }}
+          role-session-name: gha-tf-approved-${{ github.run_id }}
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ inputs.state_bucket }}" \
+            -backend-config="key=${{ inputs.state_key }}" \
+            -backend-config="region=${{ inputs.aws_region }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}
+
+      - name: Terraform apply approved plan
+        run: terraform apply -input=false -auto-approve tfplan
