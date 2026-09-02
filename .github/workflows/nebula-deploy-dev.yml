@@ -1,0 +1,48 @@
+name: Nebula API - Deploy DEV
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'nebula-api/**'
+      - '.github/workflows/nebula-deploy-dev.yml'
+      - '.github/workflows/reusable-build-ecr.yml'
+      - '.github/workflows/reusable-terraform-deploy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nebula-api-dev
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    uses: ./.github/workflows/reusable-build-ecr.yml
+    with:
+      working_directory: nebula-api
+      aws_region: ${{ vars.DEV_AWS_REGION }}
+      aws_account_id: ${{ vars.DEV_AWS_ACCOUNT_ID }}
+      aws_role_arn: ${{ vars.DEV_AWS_OIDC_ROLE_ARN }}
+      ecr_repository: ${{ vars.DEV_ECR_REPOSITORY }}
+
+  terraform:
+    needs: build-and-push
+    uses: ./.github/workflows/reusable-terraform-deploy.yml
+    with:
+      working_directory: nebula-api/infra
+      environment: dev
+      aws_region: ${{ vars.DEV_AWS_REGION }}
+      aws_account_id: ${{ vars.DEV_AWS_ACCOUNT_ID }}
+      aws_role_arn: ${{ vars.DEV_AWS_OIDC_ROLE_ARN }}
+      state_bucket: ${{ vars.DEV_TF_STATE_BUCKET }}
+      state_key: nebula-api/ecs/terraform.tfstate
+      image_uri: ${{ needs.build-and-push.outputs.image_uri }}
+      subnet_ids_json: ${{ vars.DEV_ECS_SUBNET_IDS_JSON }}
+      security_group_ids_json: ${{ vars.DEV_ECS_SECURITY_GROUP_IDS_JSON }}
+      execution_role_arn: ${{ vars.DEV_ECS_EXECUTION_ROLE_ARN }}
+      github_app_client_id: ${{ vars.TERRAFORM_GH_APP_ID }}
+      always_require_approval: false
+    secrets:
+      github_app_private_key: ${{ secrets.TERRAFORM_GH_APP_PRIVATE_KEY }}
