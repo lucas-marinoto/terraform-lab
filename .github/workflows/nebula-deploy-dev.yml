@@ -42,7 +42,7 @@ jobs:
       subnet_ids_json: ${{ vars.DEV_ECS_SUBNET_IDS_JSON }}
       security_group_ids_json: ${{ vars.DEV_ECS_SECURITY_GROUP_IDS_JSON }}
       execution_role_arn: ${{ vars.DEV_ECS_EXECUTION_ROLE_ARN }}
-      github_app_client_id: ${{ vars.TERRAFORM_GH_APP_ID }}
+      github_app_id: ${{ vars.TERRAFORM_GH_APP_ID }}
       always_require_approval: false
     secrets:
       github_app_private_key: ${{ secrets.TERRAFORM_GH_APP_PRIVATE_KEY }}
