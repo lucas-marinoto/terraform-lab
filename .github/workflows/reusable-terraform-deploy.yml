@@ -9,6 +9,10 @@ on:
       environment:
         required: true
         type: string
+      release_sha:
+        description: Git commit SHA represented by this deployment
+        required: true
+        type: string
       aws_region:
         required: true
         type: string
@@ -312,3 +316,74 @@ jobs:
 
       - name: Terraform apply approved plan
         run: terraform apply -input=false -auto-approve tfplan
+
+  record-deployment:
+    needs:
+      - plan
+      - apply-safe
+      - apply-approved
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.apply-safe.result == 'success' || needs.apply-approved.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Record successful GitHub Deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+          IMAGE_URI: ${{ inputs.image_uri }}
+        shell: bash
+        run: |
+          DEPLOYMENT_ID=$(
+            jq -n \
+              --arg ref "$RELEASE_SHA" \
+              --arg environment "$DEPLOY_ENV" \
+              --arg description "Terraform ECS deployment" \
+              --arg image_uri "$IMAGE_URI" \
+              '{
+                ref: $ref,
+                environment: $environment,
+                description: $description,
+                auto_merge: false,
+                required_contexts: [],
+                payload: {
+                  image_uri: $image_uri
+                }
+              }' |
+            gh api \
+              --method POST \
+              "/repos/${GITHUB_REPOSITORY}/deployments" \
+              --input - \
+              --jq '.id'
+          )
+
+          jq -n \
+            --arg state "success" \
+            --arg environment "$DEPLOY_ENV" \
+            --arg description "Terraform apply completed successfully" \
+            '{
+              state: $state,
+              environment: $environment,
+              description: $description,
+              auto_inactive: true
+            }' |
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            --input - \
+            >/dev/null
+
+          {
+            echo "## GitHub Deployment"
+            echo ""
+            echo "- Environment: ${DEPLOY_ENV}"
+            echo "- Release SHA: ${RELEASE_SHA}"
+            echo "- Image: ${IMAGE_URI}"
+            echo "- Deployment ID: ${DEPLOYMENT_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
