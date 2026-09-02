@@ -1,0 +1,130 @@
+name: Reusable - Build and Push ECR
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: true
+        type: string
+      aws_region:
+        required: true
+        type: string
+      aws_account_id:
+        required: true
+        type: string
+      aws_role_arn:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+    outputs:
+      image_uri:
+        description: Immutable ECR image URI using digest
+        value: ${{ jobs.build.outputs.image_uri }}
+      image_tag:
+        description: Human-friendly image tag containing Maven version and short Git SHA
+        value: ${{ jobs.build.outputs.image_tag }}
+      app_version:
+        description: Maven project version
+        value: ${{ jobs.build.outputs.app_version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      app_version: ${{ steps.meta.outputs.app_version }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: ${{ inputs.working_directory }}/pom.xml
+
+      - name: Test and package
+        run: mvn -B clean verify
+
+      - name: Read Maven version and Git SHA
+        id: meta
+        run: |
+          APP_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          SHORT_SHA=${GITHUB_SHA::7}
+          IMAGE_TAG="${APP_VERSION}-${SHORT_SHA}"
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Build image
+        run: docker build -t app:${{ steps.meta.outputs.image_tag }} .
+
+      - name: Trivy image gate
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: app:${{ steps.meta.outputs.image_tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          allowed-account-ids: ${{ inputs.aws_account_id }}
+          role-session-name: gha-ecr-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Verify ECR repository exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ inputs.ecr_repository }}" \
+            >/dev/null
+
+      - name: Tag and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr_repository }}
+          VERSION_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          SOURCE="app:${VERSION_TAG}"
+          docker tag "$SOURCE" "${REGISTRY}/${REPOSITORY}:${VERSION_TAG}"
+          docker tag "$SOURCE" "${REGISTRY}/${REPOSITORY}:${GITHUB_SHA}"
+          docker push "${REGISTRY}/${REPOSITORY}:${VERSION_TAG}"
+          docker push "${REGISTRY}/${REPOSITORY}:${GITHUB_SHA}"
+
+      - name: Resolve immutable image digest
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr_repository }}
+        run: |
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+
+          test -n "$DIGEST" && test "$DIGEST" != "None"
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}@${DIGEST}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "Deployed image: ${IMAGE_URI}" >> "$GITHUB_STEP_SUMMARY"
