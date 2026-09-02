@@ -33,6 +33,7 @@ jobs:
     with:
       working_directory: nebula-api/infra
       environment: dev
+      release_sha: ${{ github.sha }}
       aws_region: ${{ vars.DEV_AWS_REGION }}
       aws_account_id: ${{ vars.DEV_AWS_ACCOUNT_ID }}
       aws_role_arn: ${{ vars.DEV_AWS_OIDC_ROLE_ARN }}
