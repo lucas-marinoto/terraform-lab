@@ -1,0 +1,23 @@
+name: Nebula API - PR Quality
+
+on:
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - 'nebula-api/**'
+      - '.github/workflows/nebula-pr.yml'
+      - '.github/workflows/reusable-maven-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nebula-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  application-quality:
+    uses: ./.github/workflows/reusable-maven-ci.yml
+    with:
+      working_directory: nebula-api
